@@ -15,6 +15,31 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+
+class LoRALinear(nn.Linear):
+    """Linear layer with Low-Rank Adaptation (LoRA)."""
+
+    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0.0, bias=True):
+        super().__init__(in_features, out_features, bias=bias)
+        self.r = r
+        if r > 0:
+            self.lora_A = nn.Linear(in_features, r, bias=False)
+            self.lora_B = nn.Linear(r, out_features, bias=False)
+            self.scaling = lora_alpha / r
+            self.lora_dropout = nn.Dropout(lora_dropout)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+        else:
+            self.lora_A = None
+            self.lora_B = None
+            self.lora_dropout = nn.Identity()
+
+    def forward(self, x):
+        result = super().forward(x)
+        if self.r > 0:
+            result = result + self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+        return result
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -32,9 +57,13 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = LoRALinear(config.n_embd, 3 * config.n_embd, r=config.lora_r,
+                                 lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
+                                 bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = LoRALinear(config.n_embd, config.n_embd, r=config.lora_r,
+                                 lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
+                                 bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -79,9 +108,13 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = LoRALinear(config.n_embd, 4 * config.n_embd, r=config.lora_r,
+                                  lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
+                                  bias=config.bias)
         self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = LoRALinear(4 * config.n_embd, config.n_embd, r=config.lora_r,
+                                  lora_alpha=config.lora_alpha, lora_dropout=config.lora_dropout,
+                                  bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -114,6 +147,9 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    lora_r: int = 0
+    lora_alpha: int = 1
+    lora_dropout: float = 0.0
 
 class GPT(nn.Module):
 
@@ -207,8 +243,9 @@ class GPT(nn.Module):
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         override_args = override_args or {} # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == 'dropout' for k in override_args)
+        # allow overriding dropout and LoRA hyperparameters
+        allowed_keys = {'dropout', 'lora_r', 'lora_alpha', 'lora_dropout'}
+        assert all(k in allowed_keys for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
@@ -223,16 +260,17 @@ class GPT(nn.Module):
         config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
         config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
         config_args['bias'] = True # always True for GPT model checkpoints
-        # we can override the dropout rate, if desired
-        if 'dropout' in override_args:
-            print(f"overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
+        # override dropout or LoRA hyperparameters if provided
+        for k in ['dropout', 'lora_r', 'lora_alpha', 'lora_dropout']:
+            if k in override_args:
+                print(f"overriding {k} to {override_args[k]}")
+                config_args[k] = override_args[k]
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias') and 'lora_' not in k] # discard mask/buffer and LoRA params
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)

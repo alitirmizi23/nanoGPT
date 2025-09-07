@@ -15,30 +15,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-
-class LoRALinear(nn.Linear):
-    """Linear layer with Low-Rank Adaptation (LoRA)."""
-
-    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0.0, bias=True):
-        super().__init__(in_features, out_features, bias=bias)
-        self.r = r
-        if r > 0:
-            self.lora_A = nn.Linear(in_features, r, bias=False)
-            self.lora_B = nn.Linear(r, out_features, bias=False)
-            self.scaling = lora_alpha / r
-            self.lora_dropout = nn.Dropout(lora_dropout)
-            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B.weight)
-        else:
-            self.lora_A = None
-            self.lora_B = None
-            self.lora_dropout = nn.Identity()
-
-    def forward(self, x):
-        result = super().forward(x)
-        if self.r > 0:
-            result = result + self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
-        return result
+from lora import LoRALinear
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """

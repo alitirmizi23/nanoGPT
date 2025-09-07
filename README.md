@@ -225,3 +225,15 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## Llama 3.1 fine-tuning
+
+Support for Meta's [Llama 3.1](https://huggingface.co/meta-llama) models has been added via the `llama_model.py` and `train_llama.py` scripts. Pretrained checkpoints (8B or 70B) are loaded from Hugging Face and LoRA or SingLoRA adapters can be applied for efficient fine-tuning. The adapters swap in for every linear layer in the Hugging Face model and are zero-initialized, so wrapping a checkpoint leaves its initial forward pass unchanged.
+
+Example usage:
+
+```sh
+python train_llama.py --config=config/finetune_llama3_lora.py
+```
+
+Set `init_from` in the config to `"meta-llama/Llama-3.1-70B"` to target the 70B model.

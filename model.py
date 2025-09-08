@@ -49,8 +49,9 @@ class SingLoRALinear(nn.Linear):
         self.r = r
         if r > 0:
             dim = max(in_features, out_features)
-            self.singlora_A = nn.Parameter(torch.empty(dim, r))
-            nn.init.kaiming_uniform_(self.singlora_A, a=math.sqrt(5))
+            # initialize to zeros so that injecting SingLoRA leaves
+            # the pretrained model's forward pass unchanged
+            self.singlora_A = nn.Parameter(torch.zeros(dim, r))
             self.scaling = alpha / r
             self.singlora_dropout = nn.Dropout(dropout)
         else:

@@ -225,3 +225,32 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 ## acknowledgements
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
+
+## Llama 3.1 fine-tuning
+
+Support for Meta's [Llama 3.1](https://huggingface.co/meta-llama) models has been added via the `llama_model.py` and `train_llama.py` scripts. Pretrained checkpoints (8B or 70B) are loaded from Hugging Face and LoRA or SingLoRA adapters can be applied for efficient fine-tuning. The adapters swap in for every linear layer in the Hugging Face model and are zero-initialized, so wrapping a checkpoint leaves its initial forward pass unchanged.
+
+Example usage:
+
+```sh
+python train_llama.py --config=config/finetune_llama3_lora.py
+```
+
+Set `init_from` in the config to `"meta-llama/Llama-3.1-70B"` to target the 70B model.
+
+### Instruction-tuning datasets
+
+Several supervised fine-tuning (SFT) corpora can be converted into the
+binary format expected by `train_llama.py` via the helper script
+`data/sft/prepare.py`. It downloads a dataset, formats each
+instruction/response pair with the tokenizer's chat template and writes
+`train.bin`/`val.bin` into `data/<dataset>/`.
+
+Example for the Tulu personas dataset:
+
+```sh
+python data/sft/prepare.py --dataset tulu
+python train_llama.py --config=config/finetune_llama3_lora.py --dataset=tulu
+```
+
+Other supported values for `--dataset` are `ifeval` and `autoif`.

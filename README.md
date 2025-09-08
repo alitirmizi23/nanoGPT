@@ -237,3 +237,20 @@ python train_llama.py --config=config/finetune_llama3_lora.py
 ```
 
 Set `init_from` in the config to `"meta-llama/Llama-3.1-70B"` to target the 70B model.
+
+### Instruction-tuning datasets
+
+Several supervised fine-tuning (SFT) corpora can be converted into the
+binary format expected by `train_llama.py` via the helper script
+`data/sft/prepare.py`. It downloads a dataset, formats each
+instruction/response pair with the tokenizer's chat template and writes
+`train.bin`/`val.bin` into `data/<dataset>/`.
+
+Example for the Tulu personas dataset:
+
+```sh
+python data/sft/prepare.py --dataset tulu
+python train_llama.py --config=config/finetune_llama3_lora.py --dataset=tulu
+```
+
+Other supported values for `--dataset` are `ifeval` and `autoif`.

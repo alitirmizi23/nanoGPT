@@ -109,8 +109,9 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+data_dtype = np.uint16 if (meta_vocab_size or 0) <= np.iinfo(np.uint16).max else np.uint32
+train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=data_dtype, mode='r')
+val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=data_dtype, mode='r')
 
 def get_batch(split):
     data = train_data if split == 'train' else val_data

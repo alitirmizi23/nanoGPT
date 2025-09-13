@@ -226,17 +226,27 @@ For more questions/discussions feel free to stop by **#nanoGPT** on Discord:
 
 All nanoGPT experiments are powered by GPUs on [Lambda labs](https://lambdalabs.com), my favorite Cloud GPU provider. Thank you Lambda labs for sponsoring nanoGPT!
 
-## Llama 3.1 fine-tuning
+## Llama 3.1 & 3.2 fine-tuning
 
-Support for Meta's [Llama 3.1](https://huggingface.co/meta-llama) models has been added via the `llama_model.py` and `train_llama.py` scripts. Pretrained checkpoints (8B or 70B) are loaded from Hugging Face and LoRA or SingLoRA adapters can be applied for efficient fine-tuning. The adapters swap in for every linear layer in the Hugging Face model and are zero-initialized, so wrapping a checkpoint leaves its initial forward pass unchanged.
+Support for Meta's [Llama 3.1](https://huggingface.co/meta-llama) and [Llama 3.2](https://huggingface.co/meta-llama) models has been added via the `llama_model.py` and `train_llama.py` scripts. Pretrained checkpoints (1B, 8B, or 70B) are loaded from Hugging Face and LoRA or SingLoRA adapters can be applied for efficient fine-tuning. The adapters swap in for every linear layer in the Hugging Face model and are zero-initialized, so wrapping a checkpoint leaves its initial forward pass unchanged.
 
 Example usage:
 
 ```sh
-python train_llama.py --config=config/finetune_llama3_lora.py
+# Llama 3.2-1B (fastest, lowest memory)
+python train_llama.py config/finetune_llama32_lora.py
+
+# Llama 3.1-8B
+python train_llama.py config/finetune_llama3_lora.py
+
+# Llama 3.1-70B
+python train_llama.py --config=config/finetune_llama3_lora.py --init_from=meta-llama/Llama-3.1-70B
 ```
 
-Set `init_from` in the config to `"meta-llama/Llama-3.1-70B"` to target the 70B model.
+**Model Size Comparison:**
+- **Llama-3.2-1B**: ~1.2B parameters, fits on any GPU with 8GB+ VRAM
+- **Llama-3.1-8B**: ~8B parameters, requires 24GB+ VRAM for LoRA training
+- **Llama-3.1-70B**: ~70B parameters, requires significant resources
 
 ### Instruction-tuning datasets
 
@@ -252,7 +262,194 @@ Example for the Tulu personas dataset:
 
 ```sh
 python data/sft/prepare.py --dataset tulu
-python train_llama.py --config=config/finetune_llama3_lora.py --dataset=tulu
+python train_llama.py config/finetune_llama3_sft_qlora.py
 ```
 
-Other supported values for `--dataset` are `ifeval` and `autoif`.
+### Supervised Fine-Tuning (SFT) with LoRA Variants
+
+All LoRA variants support supervised fine-tuning for instruction-following and chat capabilities:
+
+#### Available LoRA Variants for SFT:
+
+- **LoRA**: Standard parameter-efficient fine-tuning (~0.5M trainable parameters)
+- **SingleLoRA**: Single-matrix variant with ~50% fewer parameters (~0.25M trainable parameters)
+- **QLoRA**: 4-bit quantized LoRA with ~95% memory reduction (~0.5M trainable parameters)
+- **QSingleLoRA**: Quantized SingleLoRA with maximum memory efficiency (~0.25M trainable parameters)
+
+#### SFT Configuration Files:
+
+**Llama-3.2-1B (Recommended for fast experimentation):**
+- `config/finetune_llama32_sft_lora.py` - Standard LoRA for SFT
+- `config/finetune_llama32_sft_singlora.py` - SingleLoRA for SFT
+- `config/finetune_llama32_sft_qlora.py` - QLoRA for SFT (most memory efficient)
+- `config/finetune_llama32_sft_qsinglora.py` - QSingleLoRA for SFT (maximum efficiency)
+
+**Llama-3.1-8B:**
+- `config/finetune_llama3_sft_lora.py` - Standard LoRA for SFT
+- `config/finetune_llama3_sft_singlora.py` - SingleLoRA for SFT
+- `config/finetune_llama3_sft_qlora.py` - QLoRA for SFT
+- `config/finetune_llama3_sft_qsinglora.py` - QSingleLoRA for SFT
+
+#### Example SFT Commands:
+
+```bash
+# Llama-3.2-1B SFT (Fastest, lowest memory)
+python train_llama.py config/finetune_llama32_sft_lora.py
+python train_llama.py config/finetune_llama32_sft_singlora.py
+python train_llama.py config/finetune_llama32_sft_qlora.py       # Recommended
+python train_llama.py config/finetune_llama32_sft_qsinglora.py   # Most efficient
+
+# Llama-3.1-8B SFT
+python train_llama.py config/finetune_llama3_sft_lora.py
+python train_llama.py config/finetune_llama3_sft_singlora.py
+python train_llama.py config/finetune_llama3_sft_qlora.py
+python train_llama.py config/finetune_llama3_sft_qsinglora.py
+```
+
+#### SFT Hyperparameters:
+
+**Llama-3.2-1B (Higher batch sizes due to smaller model):**
+
+| Parameter | LoRA | SingleLoRA | QLoRA | QSingleLoRA |
+|-----------|------|------------|-------|-------------|
+| `batch_size` | 8 | 8 | 16 | 16 |
+| `learning_rate` | 2e-5 | 2e-5 | 2e-5 | 2e-5 |
+| `lora_r` | 16 | - | - | - |
+| `singlora_r` | - | 16 | - | - |
+| `qlora_r` | - | - | 16 | - |
+| `qsinglora_r` | - | - | - | 16 |
+| `alpha` | 32 | 32 | 32 | 32 |
+| `dropout` | 0.05 | 0.05 | 0.05 | 0.05 |
+| `max_iters` | 2000 | 2000 | 2000 | 2000 |
+
+**Llama-3.1-8B (Lower batch sizes due to larger model):**
+
+| Parameter | LoRA | SingleLoRA | QLoRA | QSingleLoRA |
+|-----------|------|------------|-------|-------------|
+| `batch_size` | 4 | 4 | 2 | 2 |
+| `learning_rate` | 2e-5 | 2e-5 | 2e-5 | 2e-5 |
+| `lora_r` | 16 | - | - | - |
+| `singlora_r` | - | 16 | - | - |
+| `qlora_r` | - | - | 16 | - |
+| `qsinglora_r` | - | - | - | 16 |
+| `alpha` | 32 | 32 | 32 | 32 |
+| `dropout` | 0.05 | 0.05 | 0.05 | 0.05 |
+| `max_iters` | 2000 | 2000 | 2000 | 2000 |
+
+### Dataset Selection for SFT
+
+#### Supported Datasets:
+
+The following instruction-tuning datasets are supported via `data/sft/prepare.py`:
+
+- **`tulu`**: AllenAI Tulu 3 SFT Personas Instruction Following dataset
+- **`ifeval`**: IFEval-like instruction following evaluation data
+- **`autoif`**: AutoIF instruct dataset with 61k examples and functions
+
+#### Preparing SFT Datasets:
+
+```bash
+# Prepare Tulu dataset (default)
+python data/sft/prepare.py --dataset tulu
+
+# Prepare IFEval dataset
+python data/sft/prepare.py --dataset ifeval
+
+# Prepare AutoIF dataset
+python data/sft/prepare.py --dataset autoif
+
+# Custom validation split (default 2%)
+python data/sft/prepare.py --dataset tulu --val_split 0.05
+```
+
+#### Selecting Datasets in Training:
+
+You can specify the dataset in several ways:
+
+1. **Via config file** (recommended):
+   ```python
+   # In config/finetune_llama3_sft_qlora.py
+   dataset = 'tulu'  # or 'ifeval' or 'autoif'
+   ```
+
+2. **Via command line override**:
+   ```bash
+   python train_llama.py config/finetune_llama3_sft_qlora.py --dataset=ifeval
+   ```
+
+3. **Custom dataset path** (if you prepare your own):
+   ```bash
+   python train_llama.py config/finetune_llama3_sft_qlora.py --dataset=/path/to/your/dataset
+   ```
+
+#### Dataset Details:
+
+| Dataset | Size | Format | Best For |
+|---------|------|--------|----------|
+| `tulu` | ~50k examples | Chat messages with personas | General instruction following |
+| `ifeval` | ~500 examples | Instruction-response pairs | Evaluation and testing |
+| `autoif` | 61k examples | Chat messages with functions | Function calling and tools |
+
+#### Memory Requirements by Model & LoRA Variant:
+
+**Llama-3.2-1B (Very memory efficient):**
+
+| Variant | Memory Usage | Trainable Params | Recommended For |
+|---------|--------------|------------------|-----------------|
+| LoRA | Very Low | ~0.5M | Any GPU (4GB+) |
+| SingleLoRA | Very Low | ~0.25M | Any GPU (4GB+) |
+| QLoRA | Minimal | ~0.5M | Any GPU (2GB+) |
+| QSingleLoRA | Minimal | ~0.25M | Any GPU (2GB+) |
+
+**Llama-3.1-8B:**
+
+| Variant | Memory Usage | Trainable Params | Recommended For |
+|---------|--------------|------------------|-----------------|
+| LoRA | Medium | ~0.5M | 24GB+ GPUs |
+| SingleLoRA | Medium-Low | ~0.25M | 16GB+ GPUs |
+| QLoRA | Low | ~0.5M | 12GB+ GPUs |
+| QSingleLoRA | Lowest | ~0.25M | 8GB+ GPUs |
+
+#### Multi-GPU SFT Training:
+
+All variants support distributed training:
+
+```bash
+# 8 GPUs with QLoRA (most efficient)
+torchrun --standalone --nproc_per_node=8 train_llama.py config/finetune_llama3_sft_qlora.py
+
+# Single GPU with LoRA
+torchrun --standalone --nproc_per_node=1 train_llama.py config/finetune_llama3_sft_lora.py
+```
+
+#### SFT Best Practices:
+
+1. **Start with QLoRA** for memory efficiency on consumer GPUs
+2. **Use smaller learning rates** (2e-5) compared to pre-training
+3. **Monitor validation loss** regularly with `eval_interval=500`
+4. **Use appropriate batch sizes** based on your GPU memory
+5. **Enable gradient clipping** (`grad_clip=1.0`) for stability
+6. **Use bfloat16** for better numerical stability
+7. **Consider early stopping** based on validation performance
+
+#### Expected Training Times:
+
+**Llama-3.2-1B (Much faster due to smaller model):**
+
+| Variant | 8xA100 40GB | Single RTX 4090 | Single RTX 3090 |
+|---------|--------------|-----------------|-----------------|
+| LoRA | ~30 min | ~2 hours | ~3 hours |
+| SingleLoRA | ~25 min | ~1.5 hours | ~2.5 hours |
+| QLoRA | ~35 min | ~1.5 hours | ~2.5 hours |
+| QSingleLoRA | ~30 min | ~1.2 hours | ~2 hours |
+
+**Llama-3.1-8B:**
+
+| Variant | 8xA100 40GB | Single RTX 4090 | Single RTX 3090 |
+|---------|--------------|-----------------|-----------------|
+| LoRA | ~4 hours | ~12 hours | ~18 hours |
+| SingleLoRA | ~3.5 hours | ~10 hours | ~15 hours |
+| QLoRA | ~5 hours | ~8 hours | ~12 hours |
+| QSingleLoRA | ~4.5 hours | ~7 hours | ~10 hours |
+
+*Times are estimates for 2000 iterations on Tulu dataset

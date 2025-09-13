@@ -43,6 +43,18 @@ lora_dropout = 0.0
 singlora_r = 0
 singlora_alpha = 1
 singlora_dropout = 0.0
+# QLoRA parameters
+qlora_r = 0
+qlora_alpha = 1
+qlora_dropout = 0.0
+qlora_bits = 4
+qlora_blocksize = 64
+# QSingleLoRA parameters
+qsinglora_r = 0
+qsinglora_alpha = 1
+qsinglora_dropout = 0.0
+qsinglora_bits = 4
+qsinglora_blocksize = 64
 
 learning_rate = 3e-4
 max_iters = 10000
@@ -64,8 +76,10 @@ compile = True
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
-if lora_r > 0 and singlora_r > 0:
-    raise ValueError('LoRA and SingLoRA cannot be used together')
+# Check mutual exclusivity between all LoRA variants
+lora_variants = [lora_r > 0, singlora_r > 0, qlora_r > 0, qsinglora_r > 0]
+if sum(lora_variants) > 1:
+    raise ValueError('Only one LoRA variant can be enabled at a time')
 # -----------------------------------------------------------------------------
 
 # ddp setup
@@ -129,14 +143,34 @@ def get_batch(split):
 model = load_pretrained_llama(init_from,
                               lora_r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                               singlora_r=singlora_r, singlora_alpha=singlora_alpha, singlora_dropout=singlora_dropout,
+                              qlora_r=qlora_r, qlora_alpha=qlora_alpha, qlora_dropout=qlora_dropout,
+                              qlora_bits=qlora_bits, qlora_blocksize=qlora_blocksize,
+                              qsinglora_r=qsinglora_r, qsinglora_alpha=qsinglora_alpha, qsinglora_dropout=qsinglora_dropout,
+                              qsinglora_bits=qsinglora_bits, qsinglora_blocksize=qsinglora_blocksize,
                               device=device, dtype=dtype)
 
-if lora_r > 0 or singlora_r > 0:
+# Handle parameter freezing for all LoRA variants
+has_lora = any([lora_r > 0, singlora_r > 0, qlora_r > 0, qsinglora_r > 0])
+if has_lora:
     for name, param in model.named_parameters():
-        if 'lora_' not in name and 'singlora_' not in name:
+        # Freeze parameters that are not LoRA adapters or quantization parameters
+        is_adapter = ('lora_' in name or 'singlora_' in name or
+                     'quantized_' in name or 'weight_scale' in name or 'weight_zero' in name)
+        if not is_adapter:
             param.requires_grad = False
+
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    mode = 'LoRA' if lora_r > 0 else 'SingLoRA'
+
+    # Determine which mode is enabled
+    if qlora_r > 0:
+        mode = 'QLoRA'
+    elif qsinglora_r > 0:
+        mode = 'QSingleLoRA'
+    elif singlora_r > 0:
+        mode = 'SingLoRA'
+    else:
+        mode = 'LoRA'
+
     print(f"{mode} enabled, trainable parameters: {trainable}")
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))

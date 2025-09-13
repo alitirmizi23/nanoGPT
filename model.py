@@ -16,6 +16,163 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
+class QuantizedLinear(nn.Module):
+    """Base class for quantized linear layers with 4-bit quantization."""
+
+    def __init__(self, in_features, out_features, bias=True, bits=4, blocksize=64):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.bits = bits
+        self.blocksize = blocksize
+
+        # Store original weight for quantization
+        self.register_buffer('weight', torch.zeros(out_features, in_features))
+        if bias:
+            self.register_buffer('bias', torch.zeros(out_features))
+        else:
+            self.register_buffer('bias', None)
+
+        # Quantization parameters
+        self.register_buffer('weight_scale', torch.ones(out_features // blocksize + 1, in_features // blocksize + 1))
+        self.register_buffer('weight_zero', torch.zeros(out_features // blocksize + 1, in_features // blocksize + 1, dtype=torch.int8))
+
+        self.quantized = False
+
+    def quantize_weight(self):
+        """Quantize the weight matrix to 4-bit."""
+        if self.quantized:
+            return
+
+        weight = self.weight.clone()
+        out_blocks = (self.out_features + self.blocksize - 1) // self.blocksize
+        in_blocks = (self.in_features + self.blocksize - 1) // self.blocksize
+
+        # Initialize quantized storage
+        self.register_buffer('quantized_weight', torch.zeros(out_blocks, in_blocks, self.blocksize, self.blocksize, dtype=torch.uint8))
+
+        for i in range(out_blocks):
+            for j in range(in_blocks):
+                out_start = i * self.blocksize
+                out_end = min((i + 1) * self.blocksize, self.out_features)
+                in_start = j * self.blocksize
+                in_end = min((j + 1) * self.blocksize, self.in_features)
+
+                block = weight[out_start:out_end, in_start:in_end]
+                if block.numel() == 0:
+                    continue
+
+                # Compute scale and zero point
+                block_min, block_max = block.min(), block.max()
+                scale = (block_max - block_min) / (2**self.bits - 1)
+                zero_point = torch.round(-block_min / scale) if scale != 0 else torch.tensor(0.0)
+
+                # Quantize
+                quantized = torch.round((block - block_min) / scale).clamp(0, 2**self.bits - 1).to(torch.uint8)
+
+                # Store in the appropriate block
+                self.quantized_weight[i, j, :out_end-out_start, :in_end-in_start] = quantized
+                self.weight_scale[i, j] = scale
+                self.weight_zero[i, j] = zero_point.to(torch.int8)
+
+        self.quantized = True
+
+    def dequantize_weight(self, block_i, block_j):
+        """Dequantize a specific block."""
+        out_start = block_i * self.blocksize
+        out_end = min((block_i + 1) * self.blocksize, self.out_features)
+        in_start = block_j * self.blocksize
+        in_end = min((block_j + 1) * self.blocksize, self.in_features)
+
+        quantized = self.quantized_weight[block_i, block_j, :out_end-out_start, :in_end-in_start]
+        scale = self.weight_scale[block_i, block_j]
+        zero_point = self.weight_zero[block_i, block_j]
+
+        return scale * (quantized.to(torch.float32) - zero_point.to(torch.float32))
+
+    def forward(self, x):
+        if not self.quantized:
+            return F.linear(x, self.weight, self.bias)
+
+        # For simplicity in this implementation, we'll dequantize on the fly
+        # In a real optimized implementation, you'd want to fuse this with the matrix multiplication
+        full_weight = torch.zeros_like(self.weight)
+        out_blocks = (self.out_features + self.blocksize - 1) // self.blocksize
+        in_blocks = (self.in_features + self.blocksize - 1) // self.blocksize
+
+        for i in range(out_blocks):
+            for j in range(in_blocks):
+                out_start = i * self.blocksize
+                out_end = min((i + 1) * self.blocksize, self.out_features)
+                in_start = j * self.blocksize
+                in_end = min((j + 1) * self.blocksize, self.in_features)
+
+                full_weight[out_start:out_end, in_start:in_end] = self.dequantize_weight(i, j)
+
+        return F.linear(x, full_weight, self.bias)
+
+
+class QLoRALinear(QuantizedLinear):
+    """Quantized Linear layer with Low-Rank Adaptation (QLoRA)."""
+
+    def __init__(self, in_features, out_features, r=0, lora_alpha=1, lora_dropout=0.0, bias=True, bits=4, blocksize=64):
+        super().__init__(in_features, out_features, bias, bits, blocksize)
+        self.r = r
+        if r > 0:
+            self.lora_A = nn.Linear(in_features, r, bias=False)
+            self.lora_B = nn.Linear(r, out_features, bias=False)
+            self.scaling = lora_alpha / r
+            self.lora_dropout = nn.Dropout(lora_dropout)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+        else:
+            self.lora_A = None
+            self.lora_B = None
+            self.lora_dropout = nn.Identity()
+
+    def forward(self, x):
+        # Base quantized computation
+        result = super().forward(x)
+
+        # Add LoRA adaptation if enabled
+        if self.r > 0:
+            result = result + self.lora_B(self.lora_A(self.lora_dropout(x))) * self.scaling
+
+        return result
+
+
+class QSingLoRALinear(QuantizedLinear):
+    """Quantized Linear layer with Single-matrix LoRA (QSingLoRA)."""
+
+    def __init__(self, in_features, out_features, r=0, alpha=1, dropout=0.0, bias=True, bits=4, blocksize=64):
+        super().__init__(in_features, out_features, bias, bits, blocksize)
+        self.r = r
+        if r > 0:
+            dim = max(in_features, out_features)
+            # initialize to zeros so that injecting SingLoRA leaves
+            # the pretrained model's forward pass unchanged
+            self.singlora_A = nn.Parameter(torch.zeros(dim, r))
+            self.scaling = alpha / r
+            self.singlora_dropout = nn.Dropout(dropout)
+        else:
+            self.singlora_A = None
+            self.singlora_dropout = nn.Identity()
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        # Base quantized computation
+        result = super().forward(x)
+
+        # Add SingLoRA adaptation if enabled
+        if self.r > 0:
+            A_in = self.singlora_A[: self.in_features]
+            A_out = self.singlora_A[: self.out_features]
+            result = result + (self.singlora_dropout(x) @ A_in) @ A_out.t() * self.scaling
+
+        return result
+
+
 class LoRALinear(nn.Linear):
     """Linear layer with Low-Rank Adaptation (LoRA)."""
 
@@ -84,7 +241,23 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        if config.singlora_r > 0:
+
+        # Determine which Linear variant to use based on configuration
+        if config.qlora_r > 0:
+            Linear = lambda in_f, out_f: QLoRALinear(in_f, out_f, r=config.qlora_r,
+                                                    lora_alpha=config.qlora_alpha,
+                                                    lora_dropout=config.qlora_dropout,
+                                                    bias=config.bias,
+                                                    bits=config.qlora_bits,
+                                                    blocksize=config.qlora_blocksize)
+        elif config.qsinglora_r > 0:
+            Linear = lambda in_f, out_f: QSingLoRALinear(in_f, out_f, r=config.qsinglora_r,
+                                                        alpha=config.qsinglora_alpha,
+                                                        dropout=config.qsinglora_dropout,
+                                                        bias=config.bias,
+                                                        bits=config.qsinglora_bits,
+                                                        blocksize=config.qsinglora_blocksize)
+        elif config.singlora_r > 0:
             Linear = lambda in_f, out_f: SingLoRALinear(in_f, out_f, r=config.singlora_r,
                                                        alpha=config.singlora_alpha,
                                                        dropout=config.singlora_dropout,
@@ -142,7 +315,23 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        if config.singlora_r > 0:
+
+        # Determine which Linear variant to use based on configuration
+        if config.qlora_r > 0:
+            Linear = lambda in_f, out_f: QLoRALinear(in_f, out_f, r=config.qlora_r,
+                                                    lora_alpha=config.qlora_alpha,
+                                                    lora_dropout=config.qlora_dropout,
+                                                    bias=config.bias,
+                                                    bits=config.qlora_bits,
+                                                    blocksize=config.qlora_blocksize)
+        elif config.qsinglora_r > 0:
+            Linear = lambda in_f, out_f: QSingLoRALinear(in_f, out_f, r=config.qsinglora_r,
+                                                        alpha=config.qsinglora_alpha,
+                                                        dropout=config.qsinglora_dropout,
+                                                        bias=config.bias,
+                                                        bits=config.qsinglora_bits,
+                                                        blocksize=config.qsinglora_blocksize)
+        elif config.singlora_r > 0:
             Linear = lambda in_f, out_f: SingLoRALinear(in_f, out_f, r=config.singlora_r,
                                                        alpha=config.singlora_alpha,
                                                        dropout=config.singlora_dropout,
@@ -193,6 +382,18 @@ class GPTConfig:
     singlora_r: int = 0
     singlora_alpha: int = 1
     singlora_dropout: float = 0.0
+    # QLoRA parameters
+    qlora_r: int = 0
+    qlora_alpha: int = 1
+    qlora_dropout: float = 0.0
+    qlora_bits: int = 4
+    qlora_blocksize: int = 64
+    # QSingleLoRA parameters
+    qsinglora_r: int = 0
+    qsinglora_alpha: int = 1
+    qsinglora_dropout: float = 0.0
+    qsinglora_bits: int = 4
+    qsinglora_blocksize: int = 64
 
 class GPT(nn.Module):
 
@@ -200,7 +401,14 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
-        assert not (config.lora_r > 0 and config.singlora_r > 0), "LoRA and SingLoRA are mutually exclusive"
+        # Check mutual exclusivity between different LoRA variants
+        lora_variants = [
+            config.lora_r > 0,
+            config.singlora_r > 0,
+            config.qlora_r > 0,
+            config.qsinglora_r > 0
+        ]
+        assert sum(lora_variants) <= 1, "Only one LoRA variant can be enabled at a time"
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
@@ -289,7 +497,9 @@ class GPT(nn.Module):
         override_args = override_args or {} # default to empty dict
         # allow overriding dropout and adapter hyperparameters
         allowed_keys = {'dropout', 'lora_r', 'lora_alpha', 'lora_dropout',
-                        'singlora_r', 'singlora_alpha', 'singlora_dropout'}
+                        'singlora_r', 'singlora_alpha', 'singlora_dropout',
+                        'qlora_r', 'qlora_alpha', 'qlora_dropout', 'qlora_bits', 'qlora_blocksize',
+                        'qsinglora_r', 'qsinglora_alpha', 'qsinglora_dropout', 'qsinglora_bits', 'qsinglora_blocksize'}
         assert all(k in allowed_keys for k in override_args)
         from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -307,7 +517,9 @@ class GPT(nn.Module):
         config_args['bias'] = True # always True for GPT model checkpoints
         # override dropout or adapter hyperparameters if provided
         for k in ['dropout', 'lora_r', 'lora_alpha', 'lora_dropout',
-                  'singlora_r', 'singlora_alpha', 'singlora_dropout']:
+                  'singlora_r', 'singlora_alpha', 'singlora_dropout',
+                  'qlora_r', 'qlora_alpha', 'qlora_dropout', 'qlora_bits', 'qlora_blocksize',
+                  'qsinglora_r', 'qsinglora_alpha', 'qsinglora_dropout', 'qsinglora_bits', 'qsinglora_blocksize']:
             if k in override_args:
                 print(f"overriding {k} to {override_args[k]}")
                 config_args[k] = override_args[k]
@@ -317,7 +529,8 @@ class GPT(nn.Module):
         sd = model.state_dict()
         sd_keys = sd.keys()
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')
-                   and 'lora_' not in k and 'singlora_' not in k] # discard mask/buffer and adapter params
+                   and 'lora_' not in k and 'singlora_' not in k
+                   and 'quantized_' not in k and 'weight_scale' not in k and 'weight_zero' not in k] # discard mask/buffer and adapter params
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -344,6 +557,12 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
+
+    def quantize_weights(self):
+        """Quantize the weights of QLoRA and QSingleLoRA layers after loading pretrained weights."""
+        for module in self.modules():
+            if isinstance(module, (QLoRALinear, QSingLoRALinear)):
+                module.quantize_weight()
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters

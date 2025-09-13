@@ -1,8 +1,8 @@
-# Configuration for fine-tuning Llama 3.1 with LoRA adapters
-out_dir = 'out-llama3'
-init_from = 'meta-llama/Llama-3.1-8B'
+# Configuration for fine-tuning Llama 3.2-1B with LoRA adapters
+out_dir = 'out-llama32-lora'
+init_from = 'meta-llama/Llama-3.2-1B'
 block_size = 4096
-batch_size = 4
+batch_size = 8  # Larger batch size for small 1B model
 learning_rate = 3e-4
 max_iters = 1000
 lora_r = 8

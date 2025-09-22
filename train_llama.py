@@ -4,6 +4,7 @@ The script follows the minimal style of nanoGPT's train.py but uses HuggingFace
 Transformers to load the pretrained Llama models.
 """
 
+import json
 import os
 import time
 import math
@@ -29,6 +30,10 @@ init_from = 'meta-llama/Llama-3.1-8B'  # or 'meta-llama/Llama-3.1-70B'
 wandb_log = False
 wandb_project = 'llama3'
 wandb_run_name = 'llama3_finetune'
+# tensorboard logging
+tensorboard_log = False
+tensorboard_log_dir = 'runs'
+tensorboard_run_name = None
 
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8
@@ -113,6 +118,16 @@ device_type = 'cuda' if 'cuda' in device else 'cpu'
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+tb_writer = None
+if tensorboard_log and master_process:
+    from torch.utils.tensorboard import SummaryWriter
+
+    tb_run_name = tensorboard_run_name or wandb_run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    tb_log_path = os.path.join(tensorboard_log_dir, tb_run_name)
+    os.makedirs(tb_log_path, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=tb_log_path)
+    tb_writer.add_text('config', json.dumps(config, indent=2, sort_keys=True))
+
 # data loader
 meta_path = os.path.join('data', dataset, 'meta.pkl')
 meta_vocab_size = None
@@ -184,6 +199,8 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
+raw_model = model.module if ddp else model
+
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -202,14 +219,28 @@ def estimate_loss():
 
 iter_num = 0
 best_val_loss = 1e9
+t0 = time.time()
 
 while True:
     if iter_num % eval_interval == 0:
         losses = estimate_loss()
         if master_process:
-            print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            if losses['val'] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses['val']
+            train_loss = losses['train'].item() if isinstance(losses['train'], torch.Tensor) else losses['train']
+            val_loss = losses['val'].item() if isinstance(losses['val'], torch.Tensor) else losses['val']
+            print(f"step {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
+            if tb_writer is not None:
+                current_lr = optimizer.param_groups[0]['lr']
+                tb_writer.add_scalar('loss/train', train_loss, iter_num)
+                tb_writer.add_scalar('loss/val', val_loss, iter_num)
+                tb_writer.add_scalar('lr', current_lr, iter_num)
+                tb_writer.add_scalar('perplexity/train', math.exp(min(train_loss, 20.0)), iter_num)
+                tb_writer.add_scalar('perplexity/val', math.exp(min(val_loss, 20.0)), iter_num)
+                loss_ratio = val_loss / max(train_loss, 1e-8)
+                tb_writer.add_scalar('metrics/val_to_train_loss_ratio', loss_ratio, iter_num)
+                tb_writer.add_scalar('metrics/best_val_loss', min(best_val_loss, val_loss), iter_num)
+                tb_writer.flush()
+            if val_loss < best_val_loss or always_save_checkpoint:
+                best_val_loss = val_loss
                 checkpoint = {
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -227,13 +258,58 @@ while True:
             logits = model(X).logits
             loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), Y.view(-1)) / gradient_accumulation_steps
         scaler.scale(loss).backward()
-    if grad_clip != 0.0:
+    lossf = loss.item() * gradient_accumulation_steps
+    grad_norm = None
+    should_measure_grad = tb_writer is not None
+    if grad_clip != 0.0 or should_measure_grad:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if grad_clip != 0.0:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if should_measure_grad:
+            grad_norm = grad_norm_tensor.item()
+    elif should_measure_grad:
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().float().norm(2)
+                total_norm += param_norm.item() ** 2
+        grad_norm = math.sqrt(total_norm) if total_norm > 0 else 0.0
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
+    if master_process:
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        current_lr = optimizer.param_groups[0]['lr']
+        if iter_num % log_interval == 0:
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {current_lr:.6e}")
+        if tb_writer is not None:
+            tb_writer.add_scalar('loss/train_iter', lossf, iter_num)
+            tb_writer.add_scalar('time/iter_ms', dt * 1000, iter_num)
+            tb_writer.add_scalar('lr', current_lr, iter_num)
+            tokens_processed = (iter_num + 1) * tokens_per_iter
+            tokens_per_sec = tokens_per_iter / dt if dt > 0 else 0.0
+            tb_writer.add_scalar('tokens/seen', tokens_processed, iter_num)
+            tb_writer.add_scalar('throughput/tokens_per_s', tokens_per_sec, iter_num)
+            tb_writer.add_scalar('throughput/sequences_per_s', tokens_per_sec / block_size, iter_num)
+            grad_scale = scaler.get_scale()
+            tb_writer.add_scalar('grad/scale', grad_scale, iter_num)
+            if grad_norm is not None:
+                tb_writer.add_scalar('grad/norm', grad_norm, iter_num)
+            total_param_norm = 0.0
+            for p in raw_model.parameters():
+                if not p.requires_grad:
+                    continue
+                param_norm = p.detach().float().norm(2)
+                total_param_norm += param_norm.item() ** 2
+            param_norm_value = math.sqrt(total_param_norm) if total_param_norm > 0 else 0.0
+            tb_writer.add_scalar('params/norm', param_norm_value, iter_num)
+            tb_writer.flush()
     iter_num += 1
 
 if ddp:
     destroy_process_group()
+
+if tb_writer is not None:
+    tb_writer.close()

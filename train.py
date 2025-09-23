@@ -16,6 +16,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
+import json
 import os
 import time
 import math
@@ -43,6 +44,10 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+# tensorboard logging
+tensorboard_log = False
+tensorboard_log_dir = 'runs'
+tensorboard_run_name = None
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -271,6 +276,16 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+tb_writer = None
+if tensorboard_log and master_process:
+    from torch.utils.tensorboard import SummaryWriter
+
+    tb_run_name = tensorboard_run_name or wandb_run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    tb_log_path = os.path.join(tensorboard_log_dir, tb_run_name)
+    os.makedirs(tb_log_path, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=tb_log_path)
+    tb_writer.add_text('config', json.dumps(config, indent=2, sort_keys=True))
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -287,17 +302,30 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_loss = losses['train'].item() if isinstance(losses['train'], torch.Tensor) else losses['train']
+        val_loss = losses['val'].item() if isinstance(losses['val'], torch.Tensor) else losses['val']
+        print(f"step {iter_num}: train loss {train_loss:.4f}, val loss {val_loss:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/loss": train_loss,
+                "val/loss": val_loss,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if tb_writer is not None:
+            tb_writer.add_scalar('loss/train', train_loss, iter_num)
+            tb_writer.add_scalar('loss/val', val_loss, iter_num)
+            tb_writer.add_scalar('lr', lr, iter_num)
+            tb_writer.add_scalar('mfu', running_mfu * 100, iter_num)
+            tb_writer.add_scalar('perplexity/train', math.exp(min(train_loss, 20.0)), iter_num)
+            tb_writer.add_scalar('perplexity/val', math.exp(min(val_loss, 20.0)), iter_num)
+            loss_ratio = val_loss / max(train_loss, 1e-8)
+            tb_writer.add_scalar('metrics/val_to_train_loss_ratio', loss_ratio, iter_num)
+            tb_writer.add_scalar('metrics/best_val_loss', min(best_val_loss, val_loss), iter_num)
+            tb_writer.flush()
+        if val_loss < best_val_loss or always_save_checkpoint:
+            best_val_loss = val_loss
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -329,9 +357,21 @@ while True:
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
-    if grad_clip != 0.0:
+    grad_norm = None
+    should_measure_grad = tb_writer is not None
+    if grad_clip != 0.0 or should_measure_grad:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    if grad_clip != 0.0:
+        grad_norm_tensor = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if should_measure_grad:
+            grad_norm = grad_norm_tensor.item()
+    elif should_measure_grad:
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().float().norm(2)
+                total_norm += param_norm.item() ** 2
+        grad_norm = math.sqrt(total_norm) if total_norm > 0 else 0.0
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
@@ -350,6 +390,28 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if tb_writer is not None:
+            tb_writer.add_scalar('loss/train_iter', lossf, iter_num)
+            tb_writer.add_scalar('time/iter_ms', dt * 1000, iter_num)
+            tb_writer.add_scalar('mfu_iter', running_mfu * 100, iter_num)
+            tokens_processed = (iter_num + 1) * tokens_per_iter
+            tokens_per_sec = tokens_per_iter / dt if dt > 0 else 0.0
+            tb_writer.add_scalar('tokens/seen', tokens_processed, iter_num)
+            tb_writer.add_scalar('throughput/tokens_per_s', tokens_per_sec, iter_num)
+            tb_writer.add_scalar('throughput/sequences_per_s', tokens_per_sec / block_size, iter_num)
+            grad_scale = scaler.get_scale()
+            tb_writer.add_scalar('grad/scale', grad_scale, iter_num)
+            if grad_norm is not None:
+                tb_writer.add_scalar('grad/norm', grad_norm, iter_num)
+            total_param_norm = 0.0
+            for p in raw_model.parameters():
+                if not p.requires_grad:
+                    continue
+                param_norm = p.detach().float().norm(2)
+                total_param_norm += param_norm.item() ** 2
+            param_norm_value = math.sqrt(total_param_norm) if total_param_norm > 0 else 0.0
+            tb_writer.add_scalar('params/norm', param_norm_value, iter_num)
+            tb_writer.flush()
     iter_num += 1
     local_iter_num += 1
 
@@ -359,3 +421,6 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+if tb_writer is not None:
+    tb_writer.close()

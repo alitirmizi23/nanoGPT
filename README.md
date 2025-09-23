@@ -199,6 +199,51 @@ If you'd like to sample from a model you trained, use the `--out_dir` to point t
 
 For simple model benchmarking and profiling, `bench.py` might be useful. It's identical to what happens in the meat of the training loop of `train.py`, but omits much of the other complexities.
 
+## TensorBoard logging
+
+Both the GPT pretraining script (`train.py`) and the Llama fine-tuning script (`train_llama.py`) can emit rich TensorBoard traces alongside checkpoints. Logging is disabled by default so existing workflows stay unchanged, but you can turn it on either from the command line or inside a config file.
+
+### Enabling logging
+
+- Pass `--tensorboard_log=True` when launching a run. The default log directory is `runs`, mirroring PyTorch's examples.
+- Optionally set `--tensorboard_run_name=my_experiment` to make the run folder deterministic. When unset, the scripts fall back to the W&B run name (if provided) or a timestamped name.
+- To change the base directory, override `--tensorboard_log_dir=/path/to/logs`.
+- The flags are also available inside configuration files; simply assign `tensorboard_log = True` (and related options) in the config you pass to the training script.
+
+Examples:
+
+```bash
+python train.py config/train_shakespeare_char.py \
+    --tensorboard_log=True --tensorboard_run_name=shakespeare_debug
+
+torchrun --standalone --nproc_per_node=4 train_llama.py config/finetune_llama3_lora.py \
+    --tensorboard_log=True --tensorboard_run_name=llama_lora_experiment
+```
+
+When running distributed jobs, only the rank-0 process writes events, so you can point TensorBoard at a single directory even for multi-GPU training.
+
+### Viewing dashboards
+
+Launch TensorBoard and point it at the directory you chose above:
+
+```bash
+tensorboard --logdir runs
+```
+
+TensorBoard will default to serving on <http://localhost:6006>. Forward that port if you are on a remote machine.
+
+### Metrics that are recorded
+
+In addition to the standard loss curves, the logging now includes:
+
+- Validation perplexity and the ratio between validation and training loss to highlight overfitting trends.
+- The best validation loss reached so far for quick comparisons across runs.
+- Step-level throughput (tokens/second and sequences/second) and the cumulative number of tokens processed.
+- Mixed-precision diagnostics such as the gradient scaler value, gradient norm (clipped or unclipped), and the overall parameter norm of trainable weights.
+- Hardware-oriented signals like model flop utilization (MFU) in `train.py`, along with per-iteration timing.
+
+All scalars use iteration counts for the horizontal axis so you can align GPT and Llama runs easily when comparing dashboards.
+
 Note that the code by default uses [PyTorch 2.0](https://pytorch.org/get-started/pytorch-2.0/). At the time of writing (Dec 29, 2022) this makes `torch.compile()` available in the nightly release. The improvement from the one line of code is noticeable, e.g. cutting down iteration time from ~250ms / iter to 135ms / iter. Nice work PyTorch team!
 
 ## todos
